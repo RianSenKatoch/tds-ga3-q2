@@ -2,13 +2,14 @@ import os, json, hashlib, sqlite3, threading, asyncio, uuid, re, datetime
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import traceback
+import traceback, time
 
 # ---- settings come from Render "Environment" (never put keys in code) ----
 BASE_URL = os.environ.get("BASE_URL", "https://example.onrender.com/a2a/")
 LLM_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 LLM_KEY = os.environ.get("GEMINI_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.5-flash-lite")
+THINKING = os.environ.get("THINKING_LEVEL", "minimal")   # set to "off" to disable
 MEDIA = "application/a2a+json"
 BATCH_T = "application/vnd.ga5.invoice-claim-batch+json"
 PROP_T = "application/vnd.ga5.invoice-action-proposals+json"
@@ -95,7 +96,7 @@ Reply ONLY JSON: {"decisions":[{"packageId":"","action":"","vendorName":"","invo
 CHECKS = ["valid_and_reconciled", "within_authority", "no_pending_verification",
           "not_already_paid", "no_conflicting_records"]
 
-VERIFY = """A colleague proposed settle_invoice for the invoice package below. Be a skeptical reviewer.
+VERIFY = """A colleague proposed settle_invoice for each invoice package below. Be a skeptical reviewer.
 Read the paragraph that states the controlling facts of THIS case (ignore cover sheets, archive examples,
 training decoys, and negated statements). Answer each check with true or false:
 - valid_and_reconciled: invoice, PO and receipt records agree
@@ -105,8 +106,9 @@ training decoys, and negated statements). Answer each check with true or false:
 - no_conflicting_records: no material conflict between records
 Then give the correct action (settle_invoice, request_approval, hold_invoice, reject_duplicate or open_exception)
 and the three exact bracketed references from the single controlling paragraph.
-Reply ONLY JSON: {"checks":{"valid_and_reconciled":true,"within_authority":true,"no_pending_verification":true,
-"not_already_paid":true,"no_conflicting_records":true},"action":"","evidenceRefs":["","",""],"reason":""}"""
+For EVERY package in the list give one verdict.
+Reply ONLY JSON: {"verdicts":[{"packageId":"","checks":{"valid_and_reconciled":true,"within_authority":true,"no_pending_verification":true,
+"not_already_paid":true,"no_conflicting_records":true},"action":"","evidenceRefs":["","",""],"reason":""}]}"""
 
 def refs_ok(refs, pkg_text):
     return (isinstance(refs, list) and len(refs) == 3 and len(set(refs)) == 3
@@ -124,41 +126,49 @@ def settle_confirmed(v, pkg_text):
             and all(c.get(k) is True for k in CHECKS)
             and refs_ok(v.get("evidenceRefs"), pkg_text))
 
-async def verify_settle(policy, p, sem):
-    async with sem:
-        try:
-            return await call_llm(VERIFY, f"Policy revision: {policy}\nPackage:\n{canon(p)}", 15)
-        except Exception:
-            traceback.print_exc()
-            return None
+async def verify_batch(policy, pkgs, timeout):
+    """One call checks every package we plan to settle. No answer means we will NOT settle."""
+    try:
+        res = await call_llm(VERIFY, f"Policy revision: {policy}\nPackages:\n{canon(pkgs)}", timeout)
+        return {v.get("packageId"): v for v in res.get("verdicts", []) if isinstance(v, dict)}
+    except Exception:
+        traceback.print_exc()
+        return {}
 
 def log_line(obj):
     with open("decisions.jsonl", "a") as f:
         f.write(canon(obj) + "\n")
 
 async def call_llm(system, user, timeout):
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        r = await c.post(
-            LLM_URL.format(model=LLM_MODEL),
-            headers={"Content-Type": "application/json", "X-goog-api-key": LLM_KEY},
-            json={
-                "systemInstruction": {"parts": [{"text": system}]},
-                "contents": [{"role": "user", "parts": [{"text": user}]}],
-                "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
-            })
+    cfg = {"temperature": 0, "responseMimeType": "application/json"}
+    use_think = THINKING.lower() not in ("off", "none", "")
+    for attempt in range(2):
+        gc = dict(cfg)
+        if use_think and attempt == 0:
+            gc["thinkingConfig"] = {"thinkingLevel": THINKING}
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.post(
+                LLM_URL.format(model=LLM_MODEL),
+                headers={"Content-Type": "application/json", "X-goog-api-key": LLM_KEY},
+                json={"systemInstruction": {"parts": [{"text": system}]},
+                      "contents": [{"role": "user", "parts": [{"text": user}]}],
+                      "generationConfig": gc})
+        if r.status_code == 400 and use_think and attempt == 0:
+            continue                       # this model rejects the thinking setting: retry without it
+        break
     r.raise_for_status()
     text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
     s, e = text.find("{"), text.rfind("}")
     return json.loads(text[s:e + 1])
 
-async def ask_llm(policy, pkgs):
-    res = await call_llm(PROMPT, f"Policy revision: {policy}\nPackages:\n{canon(pkgs)}", 25)
+async def ask_llm(policy, pkgs, timeout):
+    res = await call_llm(PROMPT, f"Policy revision: {policy}\nPackages:\n{canon(pkgs)}", timeout)
     return res["decisions"]
 
-async def ask_llm_safe(policy, pkgs):
+async def ask_llm_safe(policy, pkgs, timeout):
     try:
-        return [d for d in await ask_llm(policy, pkgs) if isinstance(d, dict)]
+        return [d for d in await ask_llm(policy, pkgs, timeout) if isinstance(d, dict)]
     except Exception:
         traceback.print_exc()
         return []
@@ -170,6 +180,8 @@ def pkg_key(p):
     return sha(CACHE_VERSION + canon(body))
 
 async def decide(policy, packages):
+    t0 = time.monotonic()
+    left = lambda: 38 - (time.monotonic() - t0)       # stay inside the grader's 45 s per request
     out, todo, fresh = {}, [], {}
     for p in packages:
         r = db.execute("SELECT body FROM cache WHERE h=?", (pkg_key(p),)).fetchone()
@@ -178,8 +190,8 @@ async def decide(policy, packages):
     pending = list(todo)
 
     for attempt in range(2):
-        if not todo: break
-        got = {d.get("packageId"): d for d in await ask_llm_safe(policy, todo)}
+        if not todo or left() < 8: break
+        got = {d.get("packageId"): d for d in await ask_llm_safe(policy, todo, min(26, left() - 4))}
         still = []
         for p in todo:
             d = got.get(p["packageId"])
@@ -189,9 +201,9 @@ async def decide(policy, packages):
 
     by_id = {p["packageId"]: p for p in pending}
     settles = [by_id[i] for i, d in fresh.items() if d["action"] == "settle_invoice"]
-    sem = asyncio.Semaphore(4)
-    verdicts = await asyncio.gather(*[verify_settle(policy, p, sem) for p in settles])
-    verdict_of = {p["packageId"]: v for p, v in zip(settles, verdicts)}
+    verdict_of = {}
+    if settles and left() > 6:
+        verdict_of = await verify_batch(policy, settles, min(22, left() - 2))
 
     for p in pending:
         pid, text = p["packageId"], canon(p)
