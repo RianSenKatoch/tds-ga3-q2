@@ -7,9 +7,14 @@ import traceback, time
 # ---- settings come from Render "Environment" (never put keys in code) ----
 BASE_URL = os.environ.get("BASE_URL", "https://example.onrender.com/a2a/")
 LLM_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-LLM_KEY = os.environ.get("GEMINI_API_KEY", "")
+LLM_KEY = "".join(ch for ch in os.environ.get("GEMINI_API_KEY", "") if 32 < ord(ch) < 127).strip("\"'")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.5-flash-lite")
-AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
+def _clean_tok(v):
+    v = "".join(ch for ch in (v or "") if 32 < ord(ch) < 127)      # drop spaces, newlines, odd characters
+    v = v.strip("\"'")
+    if v.lower().startswith("bearer"): v = v[6:]
+    return v
+AIPIPE_TOKEN = _clean_tok(os.environ.get("AIPIPE_TOKEN", ""))
 AIPIPE_MODEL = os.environ.get("AIPIPE_MODEL", "gpt-4.1-mini")
 THINKING = os.environ.get("THINKING_LEVEL", "low")   # set to "off" to disable
 MEDIA = "application/a2a+json"
@@ -192,7 +197,13 @@ async def call_llm(system, user, timeout, hedge=True, provider="gemini"):
         print(f"LLM ok {label} {time.monotonic()-t_start:.1f}s", flush=True)
         return out
     except Exception as e:
-        print(f"LLM FAIL {label} {type(e).__name__} after {time.monotonic()-t_start:.1f}s {str(e)[:120]}", flush=True)
+        msg = type(e).__name__ if "Bearer" in str(e) else str(e)[:120]      # never print headers (tokens)
+        print(f"LLM FAIL {label} {type(e).__name__} after {time.monotonic()-t_start:.1f}s {msg}", flush=True)
+        if provider == "aipipe" and LLM_KEY:
+            left = timeout - (time.monotonic() - t_start)
+            if left > 6:
+                out = await call_llm(system, user, left, hedge=False, provider="gemini_min")
+                return out
         raise
 
 async def _hedged(system, user, timeout):
@@ -714,7 +725,7 @@ async def mr_ask(chunk, timeout, sem, deadline):
                     out.append(x)
                 return out
             except Exception as e:
-                print("MR_ASK_FAIL", type(e).__name__, str(e)[:100], flush=True)
+                print("MR_ASK_FAIL", type(e).__name__, ("" if "Bearer" in str(e) else str(e)[:100]), flush=True)
                 rate = "429" in str(e) or "503" in str(e)
         await asyncio.sleep(2.5 * (attempt + 1) if rate else 0.5)
     return []
