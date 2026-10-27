@@ -182,10 +182,10 @@ def log_line(obj):
     with open("decisions.jsonl", "a") as f:
         f.write(canon(obj) + "\n")
 
-async def call_llm(system, user, timeout):
+async def call_llm(system, user, timeout, hedge=True):
     t_start = time.monotonic()
     try:
-        out = await _hedged(system, user, timeout)
+        out = await (_hedged(system, user, timeout) if hedge else _call_llm(system, user, timeout))
         print(f"LLM ok {LLM_MODEL} {time.monotonic()-t_start:.1f}s", flush=True)
         return out
     except Exception as e:
@@ -677,7 +677,7 @@ async def mr_ask(chunk, timeout, sem, deadline):
         if left_t < 5: return []
         async with sem:
             try:
-                res = await call_llm(MR_PROMPT, user, min(timeout, left_t - 2))
+                res = await call_llm(MR_PROMPT, user, min(timeout, left_t - 2), hedge=False)
                 out = []
                 for x in res["results"]:
                     if not isinstance(x, dict): continue
@@ -698,7 +698,7 @@ async def mr_ask(chunk, timeout, sem, deadline):
 
 async def mr_decide(dossiers):
     t0 = time.monotonic()
-    deadline = t0 + 46                                           # stay inside the grader's 55 s per request
+    deadline = t0 + 42                                           # stay inside the grader's 55 s per request
     left = lambda: deadline - time.monotonic()
     out, todo = {}, []
     now_ts = time.time()
@@ -713,7 +713,7 @@ async def mr_decide(dossiers):
     if pending and MR_SAMPLES[0] < 1:
         MR_SAMPLES[0] += 1
         print("MR_SAMPLE", mr_dossier_text(pending[0])[:3000], flush=True)
-    sem = asyncio.Semaphore(4)
+    sem = asyncio.Semaphore(5)
     fresh = {}
     for attempt in range(2):
         if not todo or left() < 9: break
