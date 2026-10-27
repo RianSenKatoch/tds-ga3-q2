@@ -82,9 +82,17 @@ Decision rules, apply in this order:
 5. ONLY if none of the above apply -> settle_invoice.
 
 How to read the documents:
-- Find the ONE paragraph that states the controlling facts of THIS case. Return its three bracketed references,
-  copied exactly, brackets included, all from that single paragraph.
-- Ignore the cover sheet, archive examples, training material and decoys.
+- Each package has several documents. The controlling paragraph is the ONE paragraph that states the commercial facts
+  of THIS case (three-way match, payment history, authority limit, verification needed, record conflicts). It carries
+  exactly THREE bracketed references like [R_ABC123] and is usually in the ledger/correspondence document.
+  Example: "The commercial records form a clean three-way match [R_A]. Although the claim is otherwise payable, it is outside
+  the operator's EUR 6149.67 authority [R_B]. Release therefore requires the financial-approval workflow [R_C]." -> request_approval,
+  evidenceRefs ["[R_A]","[R_B]","[R_C]"].
+- Return those three references copied exactly, brackets included. Never return the reference on the cover sheet that only
+  "read the normalized supplier and invoice identifiers", and never the references inside "Archive note" or "Training appendix"
+  paragraphs (those are old examples or vocabulary lists, not instructions). Filler paragraphs about offices and audit
+  export sequence numbers are noise.
+- Ignore archive examples, training material and decoys.
 - Negated statements ("not a duplicate", "no hold required") mean that action does NOT apply.
 - When unsure between settle_invoice and anything else, do NOT choose settle_invoice.
 
@@ -120,6 +128,42 @@ def valid(d, pkg_text):
             and isinstance(d.get("vendorName"), str) and d["vendorName"]
             and isinstance(d.get("invoiceNumber"), str) and d["invoiceNumber"])
 
+def repair(d, text):
+    """Fix harmless formatting slips from the model instead of throwing the whole decision away."""
+    d = dict(d)
+    if isinstance(d.get("action"), str): d["action"] = d["action"].strip().lower()
+    a = d.get("amountMinor")
+    try:
+        if isinstance(a, str): a = float(a.replace(",", "").strip())
+        if isinstance(a, float): a = int(round(a if a == int(a) else a * 100))
+    except Exception: pass
+    d["amountMinor"] = a
+    refs = d.get("evidenceRefs")
+    if isinstance(refs, list):
+        fixed = []
+        for r in refs:
+            if isinstance(r, str):
+                r = r.strip()
+                if not r.startswith("["): r = "[" + r.strip("[]") + "]"
+                if r not in fixed: fixed.append(r)
+        d["evidenceRefs"] = fixed
+    if not (isinstance(d.get("vendorName"), str) and d["vendorName"]):
+        m = re.search(r"Supplier ([^;]+);", text)
+        if m: d["vendorName"] = m.group(1).strip()
+    if not (isinstance(d.get("invoiceNumber"), str) and d["invoiceNumber"]):
+        m = re.search(r"invoice ([A-Z0-9][A-Z0-9-]+)", text)
+        if m: d["invoiceNumber"] = m.group(1).strip()
+    if not isinstance(d.get("currency"), str) or not d.get("currency"):
+        m = re.search(r"\b(INR|EUR|USD|GBP)\b", text)
+        d["currency"] = m.group(1) if m else "INR"
+    return d
+
+def why_invalid(d, text):
+    if d.get("action") not in ACTIONS: return f"action={d.get('action')!r}"
+    if not refs_ok(d.get("evidenceRefs"), text): return f"refs={d.get('evidenceRefs')!r}"
+    if not isinstance(d.get("amountMinor"), int): return f"amount={d.get('amountMinor')!r}"
+    return f"vendor/invoice={d.get('vendorName')!r}/{d.get('invoiceNumber')!r}"
+
 def settle_confirmed(v, pkg_text):
     c = v.get("checks") or {}
     return (v.get("action") == "settle_invoice"
@@ -150,10 +194,10 @@ async def call_llm(system, user, timeout):
 
 async def _hedged(system, user, timeout):
     t1 = asyncio.create_task(_call_llm(system, user, timeout))
-    done, _ = await asyncio.wait({t1}, timeout=min(11, timeout / 2))
+    done, _ = await asyncio.wait({t1}, timeout=min(8, timeout / 2))
     if done:
         return t1.result()
-    t2 = asyncio.create_task(_call_llm(system, user, max(3, timeout - 11)))
+    t2 = asyncio.create_task(_call_llm(system, user, max(3, timeout - 8)))
     pending = {t1, t2}
     last = None
     while pending:
@@ -195,11 +239,18 @@ async def ask_llm(policy, pkgs, timeout):
 async def ask_llm_safe(policy, pkgs, timeout):
     try:
         return [d for d in await ask_llm(policy, pkgs, timeout) if isinstance(d, dict)]
-    except Exception:
+    except Exception as e:
+        print("ASK_FAIL", type(e).__name__, str(e)[:150], flush=True)
         return []
 
+async def run_pass(policy, todo, timeout):
+    """Small chunks in parallel: shorter answers, much less waiting on one slow call."""
+    chunks = [todo[i:i + 4] for i in range(0, len(todo), 4)]
+    results = await asyncio.gather(*[ask_llm_safe(policy, c, timeout) for c in chunks])
+    return {d.get("packageId"): d for r in results for d in r}
+
 SAMPLE_LOGGED = False
-CACHE_VERSION = "v4"
+CACHE_VERSION = "v5"
 
 def pkg_key(p):
     body = {k: v for k, v in p.items() if k != "packageId"}
@@ -220,13 +271,17 @@ async def decide(policy, packages):
         print("SAMPLE_PACKAGE", canon(pending[0])[:3500], flush=True)
 
     for attempt in range(2):
-        if not todo or left() < 8: break
-        got = {d.get("packageId"): d for d in await ask_llm_safe(policy, todo, min(26, left() - 4))}
+        if not todo or left() < 9: break
+        got = await run_pass(policy, todo, min(24, left() - 6))
         still = []
         for p in todo:
             d = got.get(p["packageId"])
+            if d:
+                d = repair(d, canon(p))
             if d and valid(d, canon(p)): fresh[p["packageId"]] = d
-            else: still.append(p)
+            else:
+                still.append(p)
+                print("INVALID", p["packageId"], why_invalid(d, canon(p)) if d else "missing from answer", flush=True)
         todo = still
 
     by_id = {p["packageId"]: p for p in pending}
