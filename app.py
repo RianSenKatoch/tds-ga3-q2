@@ -9,7 +9,7 @@ BASE_URL = os.environ.get("BASE_URL", "https://example.onrender.com/a2a/")
 LLM_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 LLM_KEY = os.environ.get("GEMINI_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.5-flash-lite")
-THINKING = os.environ.get("THINKING_LEVEL", "minimal")   # set to "off" to disable
+THINKING = os.environ.get("THINKING_LEVEL", "low")   # set to "off" to disable
 MEDIA = "application/a2a+json"
 BATCH_T = "application/vnd.ga5.invoice-claim-batch+json"
 PROP_T = "application/vnd.ga5.invoice-action-proposals+json"
@@ -89,7 +89,8 @@ How to read the documents:
 - When unsure between settle_invoice and anything else, do NOT choose settle_invoice.
 
 Also return vendorName, invoiceNumber, amountMinor (integer, smallest currency unit, e.g. 1234.50 -> 123450) and currency.
-Keep the output short. Reply ONLY JSON: {"decisions":[{"packageId":"","action":"","vendorName":"","invoiceNumber":"","amountMinor":0,
+First write "analysis": at most 30 words stating the controlling paragraph's key facts (amount, limit, what was paid, what must be verified, what conflicts), THEN choose the action.
+Reply ONLY JSON: {"decisions":[{"packageId":"","analysis":"","action":"","vendorName":"","invoiceNumber":"","amountMinor":0,
 "currency":"","evidenceRefs":["","",""]}]}"""
 
 CHECKS = ["valid_and_reconciled", "within_authority", "no_pending_verification",
@@ -140,12 +141,29 @@ def log_line(obj):
 async def call_llm(system, user, timeout):
     t_start = time.monotonic()
     try:
-        out = await _call_llm(system, user, timeout)
+        out = await _hedged(system, user, timeout)
         print(f"LLM ok {LLM_MODEL} {time.monotonic()-t_start:.1f}s", flush=True)
         return out
     except Exception as e:
         print(f"LLM FAIL {LLM_MODEL} {type(e).__name__} after {time.monotonic()-t_start:.1f}s {str(e)[:120]}", flush=True)
         raise
+
+async def _hedged(system, user, timeout):
+    t1 = asyncio.create_task(_call_llm(system, user, timeout))
+    done, _ = await asyncio.wait({t1}, timeout=min(11, timeout / 2))
+    if done:
+        return t1.result()
+    t2 = asyncio.create_task(_call_llm(system, user, max(3, timeout - 11)))
+    pending = {t1, t2}
+    last = None
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            if t.exception() is None:
+                for p in pending: p.cancel()
+                return t.result()
+            last = t.exception()
+    raise last
 
 async def _call_llm(system, user, timeout):
     cfg = {"temperature": 0, "responseMimeType": "application/json"}
@@ -180,7 +198,8 @@ async def ask_llm_safe(policy, pkgs, timeout):
     except Exception:
         return []
 
-CACHE_VERSION = "v3"
+SAMPLE_LOGGED = False
+CACHE_VERSION = "v4"
 
 def pkg_key(p):
     body = {k: v for k, v in p.items() if k != "packageId"}
@@ -195,6 +214,10 @@ async def decide(policy, packages):
         if r: out[p["packageId"]] = json.loads(r[0])
         else: todo.append(p)
     pending = list(todo)
+    global SAMPLE_LOGGED
+    if pending and not SAMPLE_LOGGED:
+        SAMPLE_LOGGED = True
+        print("SAMPLE_PACKAGE", canon(pending[0])[:3500], flush=True)
 
     for attempt in range(2):
         if not todo or left() < 8: break
@@ -237,12 +260,15 @@ async def decide(policy, packages):
         if cacheable:
             db.execute("INSERT OR REPLACE INTO cache VALUES(?,?)", (pkg_key(p), json.dumps(d)))
     db.commit()
+    from collections import Counter
+    print("DECIDED", dict(Counter(d["action"] for d in out.values())),
+          "fresh", len(pending), "fallback", len(pending) - len(fresh), flush=True)
     return out
 
 def proposal(p, d, policy):
     a, r = d["action"], d["evidenceRefs"]
     rationale = (f"Proposing {a} for invoice {d['invoiceNumber']} from {d['vendorName']}. "
-                 f"{d.get('reason', '')} Evidence {r[0]}, {r[1]} and {r[2]} in the controlling paragraph support {a}.")[:1500]
+                 f"{d.get('reason') or d.get('analysis', '')} Evidence {r[0]}, {r[1]} and {r[2]} in the controlling paragraph support {a}.")[:1500]
     return {"packageId": p["packageId"], "actionId": "act-" + uuid.uuid4().hex, "action": a,
             "facts": {"vendorName": d["vendorName"], "invoiceNumber": d["invoiceNumber"],
                       "amountMinor": d["amountMinor"], "currency": d["currency"]},
