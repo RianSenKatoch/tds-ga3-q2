@@ -671,7 +671,8 @@ def _mr_build_core(d, r):
         payload = {"reasonCode": g("reasonCode"), "referenceId": g("referenceId")}
         if payload["reasonCode"] not in ("ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"): return None, f"reasonCode={payload['reasonCode']!r}"
     if a == "no_action" and not mr_str(payload.get("referenceId")):
-        m0 = re.search(r"ORD-[A-Z0-9]+", text) or re.search(r"CASE-[A-Z0-9]+", text)
+        m0 = (re.search(r"ORD-[A-Z0-9]+", text) or re.search(r"CASE-[A-Z0-9]+", text) or re.search(r"EVT-[A-Z0-9]+", text)
+              or re.search(r"\b(?!VLT-)[A-Z]{2,5}-[A-Z0-9]{5,}\b", text))
         if m0: payload["referenceId"] = m0.group(0)
     vals = [g(k) for k in need]
     if not all(mr_str(v) for v in vals): return None, f"fields {dict(zip(need, vals))!r}"
@@ -707,6 +708,15 @@ def _mr_build_core(d, r):
         if not any(sx.get("kind") == "approval" and st in t for sx, t in trusted_lines): return None, "status not in approval"
         if not any(sx.get("kind") != "approval" and st in t and payload["referenceId"] in t for sx, t in trusted_lines):
             return None, "status not confirmed by current order record"
+        # the approval's own scope: statuses quoted in the approval source must be exactly the status we send
+        scoped, scoped_all = set(), set()
+        for sx, t in trusted_lines:
+            if sx.get("kind") == "approval":
+                qs = {m.group(1).strip() for m in re.finditer(r"[“\"]([^”\"]{3,60})[”\"]", t)}
+                scoped_all |= qs
+                if re.search(r"names precisely|valid for|applies only|only for|only to|scope|precisely|exact|limited to", t, re.I): scoped |= qs
+        if not scoped: scoped = scoped_all
+        if scoped and scoped != {st}: return None, f"approval scope {sorted(scoped)!r} does not match status {st!r}"
         # the status must be the CURRENT one: quoted text right after "current..." on a trusted record line for this order
         cur = set()
         for sx, t in trusted_lines:
