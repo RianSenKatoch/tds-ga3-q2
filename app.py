@@ -618,7 +618,7 @@ def mr_line_src(d):
 
 TRUSTED = ("signed_internal", "authenticated_internal")
 
-def mr_build(d, r):
+def _mr_build_core(d, r):
     """Turn the model's answer into an exact proposal, or return (None, reason). Safety locks live HERE, in code."""
     a = r.get("action")
     if a not in MR_ACTIONS: return None, f"action={a!r}"
@@ -707,6 +707,20 @@ def mr_build(d, r):
         if not any(sx.get("kind") == "approval" and st in t for sx, t in trusted_lines): return None, "status not in approval"
         if not any(sx.get("kind") != "approval" and st in t and payload["referenceId"] in t for sx, t in trusted_lines):
             return None, "status not confirmed by current order record"
+        # the status must be the CURRENT one: quoted text right after "current..." on a trusted record line for this order
+        cur = set()
+        for sx, t in trusted_lines:
+            if sx.get("kind") != "approval" and payload["referenceId"] in t:
+                for m in re.finditer(r"current[^“\"”]{0,80}[“\"]([^”\"]+)[”\"]", t, re.I): cur.add(m.group(1).strip())
+        if cur and st not in cur: return None, f"status {st!r} is not the current status {sorted(cur)!r}"
+        # approval and record must refer to the same case when the approval names one
+        rec_txt = " ".join(t for sx, t in trusted_lines if sx.get("kind") != "approval" and payload["referenceId"] in t)
+        for sx, t in trusted_lines:
+            if sx.get("kind") == "approval" and target["id"] in t and payload["referenceId"] in t:
+                for cs in re.findall(r"CASE-[A-Z0-9]+", t):
+                    if rec_txt and cs not in rec_txt: return None, "approval is for a different case"
+        print("MR_SEND", d["dossierId"], target["id"], payload["referenceId"], st, "| cur", sorted(cur),
+              "| appr:", [t[:140] for sx, t in trusted_lines if sx.get("kind") == "approval" and target["id"] in t][:2], flush=True)
         bad = re.compile(r"revoked|withdrawn|expired|superseded|rescinded|cancel+ed|no longer|void\b|not valid|stale", re.I)
         for sx, t in trusted_lines:
             if sx.get("kind") == "approval" and (target["id"] in t or payload["referenceId"] in t) and bad.search(t):
@@ -715,6 +729,16 @@ def mr_build(d, r):
         if v not in text and not (a == "no_action" and v == payload.get("reasonCode")): print("WARN value not in dossier", d["dossierId"], a, v[:60], flush=True)
     return {"dossierId": d["dossierId"], "callId": mr_call_id(d), "action": a, "target": target,
             "payload": payload, "evidence": ev}, None
+
+def mr_build(d, r):
+    out, why = _mr_build_core(d, r)
+    if out is None and r.get("action") == "send_approved_notice" and why and ("status" in why or "approval" in why or "case" in why or "recipient" in why):
+        r2 = dict(r); r2["action"] = "create_draft"; r2["recipient"] = r.get("recipient") or r.get("targetId")
+        out2, why2 = _mr_build_core(d, r2)                 # a harmless draft instead of an unproven send
+        if out2 is not None:
+            print("MR_DOWNGRADE send->draft", d["dossierId"], why[:80], flush=True)
+            return out2, None
+    return out, why
 
 def mr_fallback(d):
     """Safest answer when the AI gave nothing usable: isolate it, never send anything."""
@@ -816,6 +840,7 @@ async def mr_propose(body):
         row = db.execute("SELECT req_hash, propose_resp FROM mr_evals WHERE eid=?", (eid,)).fetchone()
     if row:
         if row[0] != req_hash: return mr_err(409, "evaluationId reused with different content")
+        print("MR_PROPOSE_REPLAY", eid[:12], flush=True)
         return jr(json.loads(row[1]))
     ds = body["dossiers"]
     async with mr_decide_lock:                       # a second evaluation reuses the first one's decisions
@@ -828,6 +853,7 @@ async def mr_propose(body):
                    (eid, req_hash, json.dumps(body["receiptVerifier"]), resp["inputDigest"],
                     json.dumps(proposals), json.dumps(resp), None, None))
         db.commit()
+    print("MR_PROPOSE_OK", eid[:12], len(proposals), flush=True)
     return jr(resp)
 
 def mr_verify_sig(verifier, body, rc):
@@ -860,6 +886,7 @@ def mr_commit(body):
         if not row: return mr_err(404, "unknown evaluation")
         verifier, idg, props, ch, cresp = json.loads(row[0]), row[1], json.loads(row[2]), row[3], row[4]
         if cresp:
+            if ch == h: print("MR_COMMIT_REPLAY", eid[:12], flush=True)
             return jr(json.loads(cresp)) if ch == h else mr_err(409, "evaluation already committed with different content")
         if dg != idg: return mr_err(400, "inputDigest mismatch")
         by = {p["dossierId"]: p for p in props}
@@ -891,6 +918,7 @@ def mr_commit(body):
         db.execute("UPDATE mr_evals SET commit_hash=?, commit_resp=? WHERE eid=?", (h, json.dumps(resp), eid))
         for rc in rcs: db.execute("INSERT OR REPLACE INTO mr_nonces VALUES(?,?)", (rc["receiptId"], eid))
         db.commit()
+    print("MR_COMMIT_OK", eid[:12], "executed", sum(o["status"] == "executed" for o in outcomes), "rejected", sum(o["status"] == "rejected" for o in outcomes), flush=True)
     return jr(resp)
 
 async def mailroom(req: Request):
