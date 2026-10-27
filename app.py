@@ -88,10 +88,9 @@ How to read the documents:
 - Negated statements ("not a duplicate", "no hold required") mean that action does NOT apply.
 - When unsure between settle_invoice and anything else, do NOT choose settle_invoice.
 
-Also return vendorName, invoiceNumber, amountMinor (integer, smallest currency unit, e.g. 1234.50 -> 123450),
-currency, and "reason": one sentence on why the evidence supports the action.
-Reply ONLY JSON: {"decisions":[{"packageId":"","action":"","vendorName":"","invoiceNumber":"","amountMinor":0,
-"currency":"","evidenceRefs":["","",""],"reason":""}]}"""
+Also return vendorName, invoiceNumber, amountMinor (integer, smallest currency unit, e.g. 1234.50 -> 123450) and currency.
+Keep the output short. Reply ONLY JSON: {"decisions":[{"packageId":"","action":"","vendorName":"","invoiceNumber":"","amountMinor":0,
+"currency":"","evidenceRefs":["","",""]}]}"""
 
 CHECKS = ["valid_and_reconciled", "within_authority", "no_pending_verification",
           "not_already_paid", "no_conflicting_records"]
@@ -108,7 +107,7 @@ Then give the correct action (settle_invoice, request_approval, hold_invoice, re
 and the three exact bracketed references from the single controlling paragraph.
 For EVERY package in the list give one verdict.
 Reply ONLY JSON: {"verdicts":[{"packageId":"","checks":{"valid_and_reconciled":true,"within_authority":true,"no_pending_verification":true,
-"not_already_paid":true,"no_conflicting_records":true},"action":"","evidenceRefs":["","",""],"reason":""}]}"""
+"not_already_paid":true,"no_conflicting_records":true},"action":"","evidenceRefs":["","",""]}]}"""
 
 def refs_ok(refs, pkg_text):
     return (isinstance(refs, list) and len(refs) == 3 and len(set(refs)) == 3
@@ -132,7 +131,6 @@ async def verify_batch(policy, pkgs, timeout):
         res = await call_llm(VERIFY, f"Policy revision: {policy}\nPackages:\n{canon(pkgs)}", timeout)
         return {v.get("packageId"): v for v in res.get("verdicts", []) if isinstance(v, dict)}
     except Exception:
-        traceback.print_exc()
         return {}
 
 def log_line(obj):
@@ -140,6 +138,16 @@ def log_line(obj):
         f.write(canon(obj) + "\n")
 
 async def call_llm(system, user, timeout):
+    t_start = time.monotonic()
+    try:
+        out = await _call_llm(system, user, timeout)
+        print(f"LLM ok {LLM_MODEL} {time.monotonic()-t_start:.1f}s", flush=True)
+        return out
+    except Exception as e:
+        print(f"LLM FAIL {LLM_MODEL} {type(e).__name__} after {time.monotonic()-t_start:.1f}s {str(e)[:120]}", flush=True)
+        raise
+
+async def _call_llm(system, user, timeout):
     cfg = {"temperature": 0, "responseMimeType": "application/json"}
     use_think = THINKING.lower() not in ("off", "none", "")
     for attempt in range(2):
@@ -170,7 +178,6 @@ async def ask_llm_safe(policy, pkgs, timeout):
     try:
         return [d for d in await ask_llm(policy, pkgs, timeout) if isinstance(d, dict)]
     except Exception:
-        traceback.print_exc()
         return []
 
 CACHE_VERSION = "v3"
