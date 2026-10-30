@@ -265,12 +265,63 @@ async def _call_llm(system, user, timeout, provider="gemini"):
     obj, _ = json.JSONDecoder().raw_decode(text[i:])        # ignore any extra text after the JSON
     return obj
 
+def _decisions_of(res):
+    if isinstance(res, list): return res
+    if isinstance(res, dict):
+        for k in ("decisions", "results", "packages", "items"):
+            if isinstance(res.get(k), list): return res[k]
+        for v in res.values():
+            if isinstance(v, list) and v and isinstance(v[0], dict): return v
+        if "packageId" in res: return [res]
+    raise KeyError("decisions")
+
+AUD_NOISE = re.compile(r"archive|training|historical|previous quarter|closed reconciliation|unrelated|expired|hypothetical|superseded|vocabulary", re.I)
+
+def audit_lines(p):
+    """Alternative layout: many one-reference paragraphs. Keep the live ones, drop archive/training/historical noise."""
+    docs = p.get("documents")
+    if not isinstance(docs, list): return None
+    keep, nref = [], 0
+    for d in docs:
+        if not isinstance(d, dict): continue
+        for para in re.split(r"\n\s*\n", str(d.get("text", ""))):
+            refs = REFRX.findall(para)
+            if not refs: continue
+            nref += 1
+            if AUD_NOISE.search(para) and not re.search(r"Payment controls", para): continue
+            keep.append(para.strip())
+    return keep if nref >= 3 and keep else None
+
+AUDIT_PROMPT = """You are an accounts-payable analyst. For EACH package choose exactly one action:
+settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
+Each package is a list of short case lines. Every line carries ONE bracketed reference like [R_ABC]. Archive, training and historical lines were already removed.
+Typically the live lines are: (a) the submission line naming the supplier, invoice number, currency and stated total of THIS case,
+(b) one case-state line about THIS order (payment ledger / order-invoice reconciliation / vendor bank account and callback / delegation ceiling),
+(c) a "Payment controls" policy line.
+Decision rules, apply in this order:
+1. The commercial order/invoice was already settled or discharged and the currently submitted order or invoice is the SAME one -> reject_duplicate. A payment for a different order or invoice is NOT a duplicate.
+2. A material difference between order and invoice (amount, quantity, vendor, PO) -> open_exception.
+3. A bank-account change that is NOT yet verified (new account differs from the vendor master, callback not confirmed) -> hold_invoice. If the account is unchanged or the callback is confirmed, there is no hold.
+4. Otherwise compare the invoice total with the autonomous payment ceiling for its currency: total above the ceiling (a named approver is required) -> request_approval; total at or below the ceiling -> settle_invoice.
+Read carefully and compare numbers yourself.
+Return vendorName, invoiceNumber (as written in the submission line), amountMinor (integer minor units, 1234.50 -> 123450) and currency.
+evidenceRefs: exactly three distinct references copied exactly with brackets: the lines needed to establish the action and its arguments (normally the submission line, the case-state line and the Payment controls line).
+First write "analysis" (max 30 words), THEN the action.
+Reply ONLY JSON: {"decisions":[{"packageId":"","analysis":"","action":"","vendorName":"","invoiceNumber":"","amountMinor":0,"currency":"","evidenceRefs":["","",""]}]}"""
+
+async def ask_llm_audit(policy, pkgs, timeout):
+    slim = [{"packageId": p["packageId"], "receivedAt": p.get("receivedAt"), "lines": audit_lines(p)} for p in pkgs]
+    res = await call_llm(AUDIT_PROMPT, f"Policy revision: {policy}\nPackages:\n{canon(slim)}", timeout)
+    return _decisions_of(res)
+
 async def ask_llm(policy, pkgs, timeout):
     res = await call_llm(PROMPT, f"Policy revision: {policy}\nPackages:\n{canon(pkgs)}", timeout)
-    return res["decisions"]
+    return _decisions_of(res)
 
 async def ask_llm_safe(policy, pkgs, timeout):
     try:
+        if pkgs and all(audit_lines(p) for p in pkgs):
+            return [d for d in await ask_llm_audit(policy, pkgs, timeout) if isinstance(d, dict)]
         return [d for d in await ask_llm(policy, pkgs, timeout) if isinstance(d, dict)]
     except Exception as e:
         print("ASK_FAIL", type(e).__name__, str(e)[:150], flush=True)
@@ -278,12 +329,14 @@ async def ask_llm_safe(policy, pkgs, timeout):
 
 async def run_pass(policy, todo, timeout):
     """Small chunks in parallel: shorter answers, much less waiting on one slow call."""
-    chunks = [todo[i:i + 4] for i in range(0, len(todo), 4)]
+    aud = [p for p in todo if audit_lines(p)]
+    oth = [p for p in todo if not audit_lines(p)]
+    chunks = [aud[i:i + 3] for i in range(0, len(aud), 3)] + [oth[i:i + 4] for i in range(0, len(oth), 4)]
     results = await asyncio.gather(*[ask_llm_safe(policy, c, timeout) for c in chunks])
     return {d.get("packageId"): d for r in results for d in r}
 
 SAMPLE_LOGGED = False
-CACHE_VERSION = "v6"
+CACHE_VERSION = "v7"
 
 def pkg_key(p):
     body = {k: v for k, v in p.items() if k != "packageId"}
