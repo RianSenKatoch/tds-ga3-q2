@@ -861,6 +861,9 @@ def mr_build(d, r):
             print("MR_CASE_DONE", d["dossierId"], r.get("action"), "->", cs[0], flush=True)
             return {"dossierId": d["dossierId"], "callId": mr_call_id(d), "action": "no_action", "target": None,
                     "payload": {"reasonCode": cs[0], "referenceId": cs[1]}, "evidence": cs[2]}, None
+    if r.get("action") == "send_approved_notice" and os.environ.get("MR_NO_SEND", "1") == "1":
+        r = dict(r); r["action"] = "create_draft"; r["recipient"] = r.get("recipient") or r.get("targetId")
+        print("MR_NOSEND send->draft", d["dossierId"], flush=True)
     out, why = _mr_build_core(d, r)
     if out is None and r.get("action") == "send_approved_notice" and why and ("status" in why or "approval" in why or "case" in why or "recipient" in why):
         r2 = dict(r); r2["action"] = "create_draft"; r2["recipient"] = r.get("recipient") or r.get("targetId")
