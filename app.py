@@ -292,6 +292,76 @@ def audit_lines(p):
             keep.append(para.strip())
     return keep if nref >= 3 and keep else None
 
+
+DECOY = re.compile(r"^\s*\[[^\]]+\]\s*(Archive examples|Historical bank transfer|A previous quarter|A closed reconciliation|Archived supplier memo|Operations discussed a bank-detail change in a training)", re.I)
+LIVE = re.compile(r"Payment ledger|Vendor master|Approved autonomous|Order PO-|Signed commercial|Payment controls|submitted invoice total|callback", re.I)
+
+def audit_live(p):
+    out = []
+    for d in (p.get("documents") or []):
+        if not isinstance(d, dict): continue
+        for para in re.split(r"\n\s*\n", str(d.get("text", ""))):
+            if not REFRX.search(para) or DECOY.search(para): continue
+            if AUD_NOISE.search(para) and not LIVE.search(para): continue
+            out.append(para.strip())
+    return out
+
+def _num(x):
+    try: return float(x.replace(",", ""))
+    except Exception: return None
+
+def audit_rules(p):
+    """Deterministic reading of the templated one-reference layout. Returns (action, facts, refs) or None when undetermined."""
+    paras = audit_live(p)
+    if not paras: return None
+    used = []
+    def find(rx):
+        for para in paras:
+            m = re.search(rx, para, re.I | re.S)
+            if m:
+                if para not in used: used.append(para)
+                return m
+        return None
+    dup = exc = hold = None
+    m = find(r"previously settled order\s+(PO-[A-Za-z0-9]+).{0,40}?currently submitted order is\s+(PO-[A-Za-z0-9]+)")
+    if m: dup = (m.group(1) == m.group(2))
+    m = find(r"signed for\s+([A-Z]{3})\s+([0-9][0-9,]*\.?[0-9]*).{0,200}?submitted invoice total is\s+([A-Z]{3})\s+([0-9][0-9,]*\.?[0-9]*)")
+    total = cur = None
+    if m:
+        a, b = _num(m.group(2)), _num(m.group(4))
+        if a is not None and b is not None:
+            exc = abs(a - b) > 0.004; total, cur = b, m.group(3)
+    m = find(r"Vendor master lists account\s+(AC-\w+).{0,80}?now specify\s+(AC-\w+)(.{0,160})")
+    if m:
+        tail = m.group(3).lower()
+        confirmed = ("callback" in tail and "confirmed" in tail and not re.search(r"not (?:yet )?confirmed|unconfirmed|incomplete|pending|has not|neither|failed|rejected", tail))
+        hold = (m.group(1) != m.group(2)) and not confirmed
+    ceil = None
+    m = find(r"autonomous payment ceiling for\s+([A-Z]{3})\s+is\s+[A-Z]{3}\s+([0-9][0-9,]*\.?[0-9]*)")
+    if m: ceil = _num(m.group(2)); cur = cur or m.group(1)
+    m = find(r"Signed commercial instrument\s+(\S+)\s+covers order\s+\S+?,.{0,60}?([A-Z]{3})\s+([0-9][0-9,]*\.?[0-9]*)")
+    inv = None
+    if m:
+        inv = m.group(1)
+        if total is None: total, cur = _num(m.group(3)), m.group(2)
+    if dup is True: act = "reject_duplicate"
+    elif exc is True: act = "open_exception"
+    elif hold is True: act = "hold_invoice"
+    elif not used: return None
+    elif total is not None and ceil is not None: act = "request_approval" if total > ceil + 1e-9 else "settle_invoice"
+    else: return None
+    ctrl = next((q for q in paras if "Payment controls" in q), None)
+    if ctrl and ctrl not in used: used.append(ctrl)
+    refs = []
+    for q in used:
+        r = REFRX.findall(q)
+        if r and r[0] not in refs: refs.append(r[0])
+    for q in paras:
+        if len(refs) >= 3: break
+        r = REFRX.findall(q)
+        if r and r[0] not in refs: refs.append(r[0])
+    return act, {"total": total, "cur": cur, "inv": inv}, refs[:3]
+
 AUDIT_PROMPT = """You are an accounts-payable analyst. For EACH package choose exactly one action:
 settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
 Each package is a list of short case lines. Every line carries ONE bracketed reference like [R_ABC]. Archive, training and historical lines were already removed.
@@ -336,7 +406,7 @@ async def run_pass(policy, todo, timeout):
     return {d.get("packageId"): d for r in results for d in r}
 
 SAMPLE_LOGGED = False
-CACHE_VERSION = "v7"
+CACHE_VERSION = "v8"
 
 def pkg_key(p):
     body = {k: v for k, v in p.items() if k != "packageId"}
@@ -446,6 +516,28 @@ async def decide(policy, packages):
         still = []
         for p in todo:
             d = got.get(p["packageId"])
+            if audit_lines(p):
+                try:
+                    ar = audit_rules(p)
+                except Exception as e:
+                    ar = None; print("AUDIT_RULE_ERR", e, flush=True)
+                if ar:
+                    act, fx, refs = ar
+                    txt = canon(p)
+                    base = dict(d) if d else {}
+                    if not base.get("vendorName"):
+                        mv = re.search(r"to ([A-Z][A-Za-z0-9&.\- ]+?) previously settled", txt)
+                        base["vendorName"] = mv.group(1) if mv else "Vendor"
+                    if not base.get("invoiceNumber"): base["invoiceNumber"] = fx.get("inv") or "INV-UNKNOWN"
+                    if fx.get("total") is not None: base["amountMinor"] = int(round(fx["total"] * 100))
+                    if fx.get("cur"): base["currency"] = fx["cur"]
+                    if not (len(refs) == 3 and refs_ok(refs, txt)):
+                        refs = base.get("evidenceRefs") or refs
+                    base["evidenceRefs"] = refs
+                    print("AUDIT_RULE", p["packageId"], act, "llm=", (d or {}).get("action"), flush=True)
+                    base["action"] = act
+                    base["via"] = "ctrl"
+                    d = base
             if d:
                 d = repair(d, canon(p))
             if d and valid(d, canon(p)): fresh[p["packageId"]] = d
