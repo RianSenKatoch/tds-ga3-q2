@@ -685,6 +685,7 @@ def mr_prov(d):
 def mr_line_src(d):
     return {ln["lineId"]: s["sourceId"] for s in d.get("sources", []) for ln in s.get("lines", [])}
 
+MR_EVT = {}
 TRUSTED = ("signed_internal", "authenticated_internal")
 
 def _mr_build_core(d, r):
@@ -758,7 +759,7 @@ def _mr_build_core(d, r):
         for s in d.get("sources", []):
             if s.get("kind") == "approval" and s.get("provenance") in TRUSTED:
                 for ln in s["lines"]:
-                    if rcpt in ln["text"] and ref in ln["text"]:
+                    if re.search(r"(?<![\w.+@-])" + re.escape(rcpt) + r"(?![\w@-]|\.\w)", ln["text"]) and ref in ln["text"]:
                         ok = True
                         if ln["lineId"] not in ev: ev.append(ln["lineId"])
         if not ok: return None, "no trusted approval names this recipient and order"
@@ -798,6 +799,29 @@ def _mr_build_core(d, r):
             if sx.get("kind") == "approval" and target["id"] in t and payload["referenceId"] in t:
                 for cs in re.findall(r"CASE-[A-Z0-9]+", t):
                     if rec_txt and cs not in rec_txt: return None, "approval is for a different case"
+        # ---- v14 extra locks: revocation/consumption anywhere, expiry date, single-use across the whole session ----
+        evt_ids = set()
+        for sx, t in trusted_lines:
+            if sx.get("kind") == "approval" and target["id"] in t and payload["referenceId"] in t:
+                evt_ids |= set(re.findall(r"EVT-[A-Z0-9]+", t))
+        bad2 = re.compile(r"revoked|withdrawn|expired|superseded|rescinded|cancel+ed|no longer|void\b|not valid|stale|lapsed|already (been )?(used|consumed|redeemed)|previously used|used once|exhausted|retracted|invalidated", re.I)
+        for sx in d.get("sources", []):
+            if sx.get("provenance") == "external_untrusted": continue
+            for ln in sx.get("lines", []):
+                t = ln["text"]
+                if bad2.search(t) and (any(e in t for e in evt_ids) or target["id"] in t or (payload["referenceId"] in t and re.search(r"approv|permission|authori", t, re.I))):
+                    return None, "approval looks revoked/expired/used"
+        recv = str(d.get("receivedAt") or "")[:19]
+        for sx, t in trusted_lines:
+            if sx.get("kind") == "approval" and target["id"] in t:
+                for m in re.finditer(r"(?:until|through|expires?(?: on| at)?|valid to|not after|before)\s+(\d{4}-\d\d-\d\d(?:[T ]\d\d:\d\d(?::\d\d)?)?)", t, re.I):
+                    exp = m.group(1).replace(" ", "T")
+                    if re.fullmatch(r"\d{4}-\d\d-\d\dT?.*", recv) and recv.replace(" ", "T") > exp and not (len(exp) == 10 and recv[:10] == exp):
+                        return None, "approval expired before receipt"
+        for e in evt_ids:
+            if MR_EVT.get(e, d["dossierId"]) != d["dossierId"]:
+                return None, "approval already used for another dossier"
+        for e in evt_ids: MR_EVT.setdefault(e, d["dossierId"])
         print("MR_SEND", d["dossierId"], target["id"], payload["referenceId"], st, "| cur", sorted(cur),
               "| appr:", [t[:140] for sx, t in trusted_lines if sx.get("kind") == "approval" and target["id"] in t][:2], flush=True)
         bad = re.compile(r"revoked|withdrawn|expired|superseded|rescinded|cancel+ed|no longer|void\b|not valid|stale", re.I)
@@ -887,6 +911,7 @@ async def mr_ask(chunk, timeout, sem, deadline):
     return []
 
 async def mr_decide(dossiers):
+    MR_EVT.clear()
     t0 = time.monotonic()
     deadline = t0 + 40                                           # stay inside the grader's 55 s per request
     left = lambda: deadline - time.monotonic()
