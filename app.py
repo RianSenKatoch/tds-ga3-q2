@@ -283,11 +283,63 @@ async def run_pass(policy, todo, timeout):
     return {d.get("packageId"): d for r in results for d in r}
 
 SAMPLE_LOGGED = False
-CACHE_VERSION = "v5"
+CACHE_VERSION = "v6"
 
 def pkg_key(p):
     body = {k: v for k, v in p.items() if k != "packageId"}
     return sha(CACHE_VERSION + canon(body))
+
+
+REFRX = re.compile(r"\[[A-Za-z0-9_\-]{2,}\]")
+
+def control_of(p):
+    """The decisive paragraph carries exactly three distinct bracketed refs and is not an archive/training paragraph."""
+    docs = p.get("documents")
+    if not isinstance(docs, list): return None
+    cands = []
+    for d in docs:
+        if not isinstance(d, dict): continue
+        for para in re.split(r"\n\s*\n", str(d.get("text", ""))):
+            refs = []
+            for r in REFRX.findall(para):
+                if r not in refs: refs.append(r)
+            if len(refs) == 3 and "Archive note" not in para and "Training appendix" not in para:
+                cands.append((para.strip(), refs))
+    return cands[0] if len(cands) == 1 else None
+
+def facts_of(p):
+    docs = p.get("documents")
+    if not isinstance(docs, list): return None
+    text = "\n".join(str(d.get("text", "")) for d in docs if isinstance(d, dict))
+    m = re.search(r"Supplier (.+?); invoice ([A-Za-z0-9][A-Za-z0-9_\-]*); stated total ([A-Z]{3}) ([0-9][0-9,]*\.?[0-9]*)", text)
+    if not m: return None
+    try: amt = int(round(float(m.group(4).replace(",", "")) * 100))
+    except Exception: return None
+    return {"vendorName": m.group(1).strip(), "invoiceNumber": m.group(2), "currency": m.group(3), "amountMinor": amt}
+
+CLASSIFY = """Each item is ONE decisive paragraph from an invoice case file. Choose the single business action its facts require:
+- settle_invoice: records match (invoice, PO, receipt), amount is within the operator's authority, nothing must be verified first, and this exact invoice (same vendor AND invoice number) was NOT already paid. Everything is clean and payable now.
+- request_approval: otherwise valid, but the amount is outside the operator's delegated authority / approval limit, so a financial-approval workflow is required.
+- hold_invoice: payment must pause until a named verification (bank details, tax ID, goods receipt, vendor check, etc.) completes.
+- reject_duplicate: the SAME invoice (same vendor and same invoice number) was already paid. A payment for a DIFFERENT invoice number is NOT a duplicate.
+- open_exception: material records conflict (amounts, PO, receipt, vendor identity) and need an exception workflow.
+Read negations carefully ("not a duplicate", "no verification is required", "no conflict") - a negated statement does NOT trigger that action.
+Decide only from the paragraph. First write a "reason" of at most 25 words stating the key facts, THEN the action.
+Reply ONLY JSON: {"decisions":[{"packageId":"","reason":"","action":""}]}"""
+
+async def classify_controls(policy, items, timeout):
+    async def one(chunk):
+        try:
+            res = await call_llm(CLASSIFY, f"Policy revision: {policy}\nParagraphs:\n" + canon([{"packageId": i, "paragraph": t} for i, t in chunk]), timeout)
+            return [d for d in res.get("decisions", []) if isinstance(d, dict)]
+        except Exception as e:
+            print("CLASSIFY_FAIL", type(e).__name__, str(e)[:100], flush=True)
+            return []
+    chunks = [items[i:i + 6] for i in range(0, len(items), 6)]
+    out = {}
+    for r in await asyncio.gather(*[one(c) for c in chunks]):
+        for d in r: out[d.get("packageId")] = d
+    return out
 
 async def decide(policy, packages):
     t0 = time.monotonic()
@@ -302,6 +354,23 @@ async def decide(policy, packages):
     if pending and not SAMPLE_LOGGED:
         SAMPLE_LOGGED = True
         print("SAMPLE_PACKAGE", canon(pending[0])[:3500], flush=True)
+
+    ctrl = {}
+    for p in todo:
+        c, f = control_of(p), facts_of(p)
+        if c and f: ctrl[p["packageId"]] = (c, f)
+    if ctrl and left() > 8:
+        for attempt in range(2):
+            need = [(pid, c[0]) for pid, (c, f) in ctrl.items() if pid not in fresh]
+            if not need or left() < 8: break
+            got = await classify_controls(policy, need, min(22, left() - 4))
+            for pid, (c, f) in ctrl.items():
+                g = got.get(pid)
+                if pid not in fresh and g and str(g.get("action", "")).strip().lower() in ACTIONS:
+                    act = str(g["action"]).strip().lower()
+                    fresh[pid] = {"action": act, **f, "evidenceRefs": c[1], "reason": str(g.get("reason", ""))[:300], "via": "ctrl"}
+                    print("CTRL", act, "|", re.sub(r"\[[A-Za-z0-9_\-]{2,}\]", "[R]", c[0])[:330], flush=True)
+        todo = [p for p in todo if p["packageId"] not in fresh]
 
     for attempt in range(2):
         if not todo or left() < 9: break
@@ -318,7 +387,7 @@ async def decide(policy, packages):
         todo = still
 
     by_id = {p["packageId"]: p for p in pending}
-    settles = [by_id[i] for i, d in fresh.items() if d["action"] == "settle_invoice"]
+    settles = [by_id[i] for i, d in fresh.items() if d["action"] == "settle_invoice" and d.get("via") != "ctrl"]
     verdict_of = {}
     if settles and left() > 6:
         verdict_of = await verify_batch(policy, settles, min(22, left() - 2))
@@ -331,7 +400,7 @@ async def decide(policy, packages):
             d = {"action": "open_exception", "vendorName": "unknown", "invoiceNumber": "unknown",
                  "amountMinor": 0, "currency": "INR", "evidenceRefs": ["", "", ""], "reason": ""}
             cacheable = False
-        elif d["action"] == "settle_invoice":
+        elif d["action"] == "settle_invoice" and d.get("via") != "ctrl":
             v = verdict_of.get(pid)
             if v is None:
                 d = {**d, "action": "open_exception"}
@@ -740,7 +809,34 @@ def _mr_build_core(d, r):
     return {"dossierId": d["dossierId"], "callId": mr_call_id(d), "action": a, "target": target,
             "payload": payload, "evidence": ev}, None
 
+CASE_DONE = re.compile(r"records this item as (already completed|completed|a duplicate|duplicate|informational)|prior action has terminal event|already (been )?(sent|completed|handled|actioned)", re.I)
+
+def mr_case_state(d):
+    """If a non-external line says the case is already completed/duplicate/informational, return (reasonCode, evidence line ids)."""
+    hits = []
+    for sx in d.get("sources", []):
+        if sx.get("provenance") == "external_untrusted": continue
+        for ln in sx.get("lines", []):
+            m = CASE_DONE.search(ln["text"])
+            if m: hits.append((ln["lineId"], ln["text"], m.group(0).lower()))
+    if not hits: return None
+    blob = " ".join(h[2] for h in hits)
+    code = "ALREADY_COMPLETED" if ("complete" in blob or "terminal" in blob or "sent" in blob or "handled" in blob or "actioned" in blob) else ("DUPLICATE" if "duplicate" in blob else "INFORMATIONAL")
+    ev = [h[0] for h in hits[:2]]
+    m0 = re.search(r"ORD-[A-Z0-9]+", " ".join(h[1] for h in hits)) or re.search(r"ORD-[A-Z0-9]+", mr_dossier_text(d))
+    if not m0: return None
+    for sx in d.get("sources", []):
+        for ln in sx.get("lines", []):
+            if m0.group(0) in ln["text"] and re.search(r"follow-up|follow up", ln["text"], re.I) and ln["lineId"] not in ev: ev.append(ln["lineId"])
+    return code, m0.group(0), ev
+
 def mr_build(d, r):
+    if r.get("action") in ("send_approved_notice", "create_draft", "update_internal_record"):
+        cs = mr_case_state(d)
+        if cs:
+            print("MR_CASE_DONE", d["dossierId"], r.get("action"), "->", cs[0], flush=True)
+            return {"dossierId": d["dossierId"], "callId": mr_call_id(d), "action": "no_action", "target": None,
+                    "payload": {"reasonCode": cs[0], "referenceId": cs[1]}, "evidence": cs[2]}, None
     out, why = _mr_build_core(d, r)
     if out is None and r.get("action") == "send_approved_notice" and why and ("status" in why or "approval" in why or "case" in why or "recipient" in why):
         r2 = dict(r); r2["action"] = "create_draft"; r2["recipient"] = r.get("recipient") or r.get("targetId")
@@ -843,6 +939,32 @@ async def mr_decide(dossiers):
     print("MR_DECIDED", dict(Counter(p["action"] for p in out.values())), "fresh", len(pending), "fallback", len(pending) - len(fresh), flush=True)
     return out
 
+def mr_batch_guard(ds, proposals):
+    """One approval authorises ONE notice: if several fresh-audit dossiers send under the same approval event + order, do not send any of them."""
+    by = {d["dossierId"]: d for d in ds}
+    groups = {}
+    for p in proposals:
+        d = by[p["dossierId"]]
+        if p["action"] != "send_approved_notice" or d.get("partition") != "fresh_audit": continue
+        ev = set()
+        for sx in d.get("sources", []):
+            if sx.get("kind") == "approval":
+                for ln in sx["lines"]:
+                    if p["target"]["id"] in ln["text"]: ev |= set(re.findall(r"EVT-[A-Z0-9]+", ln["text"]))
+        groups.setdefault((tuple(sorted(ev)), p["payload"]["referenceId"]), []).append(p["dossierId"])
+    bad = {x for g in groups.values() if len(g) > 1 for x in g}
+    out = []
+    for p in proposals:
+        if p["dossierId"] in bad:
+            d = by[p["dossierId"]]
+            r = {"action": "create_draft", "recipient": p["target"]["id"], "referenceId": p["payload"]["referenceId"],
+                 "status": p["payload"]["status"], "evidence": list(p["evidence"])}
+            q, why = _mr_build_core(d, r)
+            print("MR_BATCH_GUARD send->draft", p["dossierId"], "ok" if q else why, flush=True)
+            if q: p = q
+        out.append(p)
+    return out
+
 async def mr_propose(body):
     eid = body["evaluationId"]
     req_hash = sha(canon(body))
@@ -856,6 +978,7 @@ async def mr_propose(body):
     async with mr_decide_lock:                       # a second evaluation reuses the first one's decisions
         decisions = await mr_decide(ds)
     proposals = [decisions[d["dossierId"]] for d in ds]
+    proposals = mr_batch_guard(ds, proposals)
     resp = {"profile": MR_PROFILE, "evaluationId": eid, "status": "awaiting_receipts",
             "inputDigest": sha(canon(ds)), "proposals": proposals}
     with dblock:
