@@ -359,6 +359,21 @@ async def decide(policy, packages):
     for p in todo:
         c, f = control_of(p), facts_of(p)
         if c and f: ctrl[p["packageId"]] = (c, f)
+    nshow = 0
+    for p in todo:
+        if p["packageId"] not in ctrl and nshow < 3:
+            nshow += 1
+            try:
+                info = []
+                for d in (p.get("documents") or []):
+                    for para in re.split(r"\n\s*\n", str(d.get("text", ""))):
+                        refs = []
+                        for r in REFRX.findall(para):
+                            if r not in refs: refs.append(r)
+                        info.append((len(refs), re.sub(r"\[[A-Za-z0-9_\-]{2,}\]", "[R]", para.strip())[:260]))
+                print("NOCTRL", p["packageId"], "facts", facts_of(p), "keys", sorted(p.keys()), "paras", info[:12], flush=True)
+            except Exception as e:
+                print("NOCTRL_ERR", e, flush=True)
     if ctrl and left() > 8:
         for attempt in range(2):
             need = [(pid, c[0]) for pid, (c, f) in ctrl.items() if pid not in fresh]
@@ -861,7 +876,8 @@ def mr_build(d, r):
             print("MR_CASE_DONE", d["dossierId"], r.get("action"), "->", cs[0], flush=True)
             return {"dossierId": d["dossierId"], "callId": mr_call_id(d), "action": "no_action", "target": None,
                     "payload": {"reasonCode": cs[0], "referenceId": cs[1]}, "evidence": cs[2]}, None
-    if r.get("action") == "send_approved_notice" and os.environ.get("MR_NO_SEND", "1") == "1":
+    ns = os.environ.get("MR_NO_SEND", "audit")
+    if r.get("action") == "send_approved_notice" and (ns == "1" or (ns == "audit" and d.get("partition") != "stable_core")):
         r = dict(r); r["action"] = "create_draft"; r["recipient"] = r.get("recipient") or r.get("targetId")
         print("MR_NOSEND send->draft", d["dossierId"], flush=True)
     out, why = _mr_build_core(d, r)
